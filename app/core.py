@@ -31,6 +31,19 @@
 
     lo_i' == hi_i' 的段圈数唯一，可确定用量；其余段仅保留范围，不猜测。
 
+分时单价账单金额区间（charge_amount_extremes）：
+    账单总量对账可行、总回绕次数 K 固定后，各段圈数已收紧为
+    k_i ∈ [lo_i, hi_i] 且 Σ k_i = K，段 i 用量 u_i = diff_i + k_i*M。
+    各段分时单价 p_i 为非负有限十进制数（以「分子, 十进制小数位」精确
+    给出），应收金额
+        A = Σ p_i*u_i = Σ p_i*diff_i + M*Σ p_i*(k_i - lo_i)
+    前一项与分配无关；剩余圈数 T = K - Σ lo_i 为非负整数（总量对账保证
+    T <= Σ (hi_i - lo_i)）。线性目标下最优分配由贪心直接给出，不枚举
+    圈数组合：最低金额把 T 个剩余圈按单价从低到高逐段填满余量
+    （同价按段索引升序打破平局），最高金额按单价从高到低同样贪心。
+    单价排序以分数交叉相乘比较，金额全程整数（分子）运算，不用浮点；
+    金额按各自的 10 进制定标格式化为十进制字符串返回。
+
 换表账单复核（reconcile_meter_total）：
     旧表、新表两段模数 M1、M2 可不同。两段用量分别为
         u1 = d1 + k1*M1, u2 = d2 + k2*M2
@@ -301,6 +314,144 @@ def reconcile_total(
         feasible_min_total=feasible_min_total,
         feasible_max_total=feasible_max_total,
     )
+
+
+# ---------------------------------------------------------------------------
+# 分时单价账单金额区间（charge-range）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChargeSegmentAllocation:
+    """金额极值方案中单个相邻读数段的圈数、用量与该段金额（金额分子）。"""
+
+    index: int
+    wraps: int  # 该极值方案分配给本段的回绕圈数
+    usage: int  # 本段用量 diff + wraps*modulus
+    amount_numerator: int  # 本段金额的十进制分子（金额 = numerator / 10**scale）
+    amount_scale: int  # 本段金额的十进制小数位（由该段单价定标）
+
+
+@dataclass(frozen=True)
+class ChargeExtreme:
+    """账单金额的一个极值（最低或最高）及其分段用量方案。"""
+
+    total_numerator: int  # 总金额十进制分子
+    total_scale: int  # 总金额十进制小数位（取各段单价小数位的最大值）
+    allocations: Tuple[ChargeSegmentAllocation, ...]  # 按段索引升序
+
+
+def format_decimal_string(numerator: int, scale: int) -> str:
+    """把非负十进制有理数 ``numerator / 10**scale`` 格式化为十进制字符串。
+
+    仅用于非负金额：``numerator >= 0``、``scale >= 0``。整数部分每三位
+    **不**加分隔符；``scale > 0`` 时保留恰好 ``scale`` 位小数（末尾的 0
+    不去除，保证该定标下的精确表示）。
+    """
+    if numerator < 0 or scale < 0:
+        raise ValueError("format_decimal_string 仅支持非负金额且 scale >= 0")
+    if scale == 0:
+        return str(numerator)
+    digits = str(numerator).zfill(scale + 1)
+    return f"{digits[:-scale]}.{digits[-scale:]}"
+
+
+def charge_amount_extremes(
+    diffs: Sequence[int],
+    wrap_bounds: Sequence[Tuple[int, int]],
+    total_wraps: int,
+    modulus: int,
+    prices: Sequence[Tuple[int, int]],
+) -> Tuple[ChargeExtreme, ChargeExtreme]:
+    """固定总回绕次数下精确求最低/最高应收金额及各自的分段用量方案。
+
+    调用前需已通过账单总量对账：各段圈数区间为总量约束收紧后的
+    ``[lo_i, hi_i]``（``reconcile_total`` 的 ``narrowed``），满足
+    ``Σ lo_i <= total_wraps <= Σ hi_i`` 且 ``Σ k_i = total_wraps``。
+    第 ``i`` 段用量为 ``u_i = diff_i + k_i*modulus``，分时单价
+    ``p_i = num_i / 10**scale_i``（非负有限十进制数）。
+
+    应收金额
+
+        A = Σ p_i*u_i = Σ p_i*diff_i + M*Σ p_i*(k_i - lo_i)
+
+    第一项与圈数分配无关；记剩余圈数 ``T = K - Σ lo_i``（非负整数，且
+    ``T <= Σ (hi_i - lo_i)``）。线性目标下最优由贪心给出，不枚举圈数
+    组合：
+
+    - 最低金额：段按单价从低到高（分数交叉相乘比较，同价按段索引升序）
+      排序，依次把该段余量 ``hi_i - lo_i`` 填满直至用完 ``T`` 个圈；
+    - 最高金额：段按单价从高到低排序（同价仍按段索引升序），同样贪心。
+
+    金额一律按十进制分子做整数运算（单价交叉相乘比较，无浮点）；各段
+    金额以该段单价定标格式化为十进制字符串，总金额取各段小数位最大值
+    统一对齐后求和。
+
+    :param prices: 与各段一一对应的单价 ``(分子, 小数位)``，分子须非负
+    :return: ``(最低金额方案, 最高金额方案)``，方案内分段按索引升序
+    """
+    if not (len(diffs) == len(wrap_bounds) == len(prices)):
+        raise ValueError("diffs、wrap_bounds 与 prices 数量必须一致")
+    if not diffs:
+        raise ValueError("至少需要一段读数区间")
+    for num, scale in prices:
+        if num < 0 or scale < 0:
+            raise ValueError("单价分子与小数位均须非负")
+
+    lows = [lo for lo, _ in wrap_bounds]
+    highs = [hi for _, hi in wrap_bounds]
+    total_scale = max(scale for _, scale in prices)
+    extra = total_wraps - sum(lows)
+    if extra < 0:
+        raise ValueError("total_wraps 低于各段圈数下界之和（应先通过总量对账）")
+
+    def _solve(descending_price: bool) -> ChargeExtreme:
+        # 单价为 num_i/10**scale_i：以 Fraction 精确排序（交叉相乘），
+        # 同价时按段索引升序打破平局，保证方案确定
+        order = sorted(
+            range(len(diffs)),
+            key=lambda i: (
+                -Fraction(prices[i][0], 10 ** prices[i][1])
+                if descending_price
+                else Fraction(prices[i][0], 10 ** prices[i][1]),
+                i,
+            ),
+        )
+        wraps = list(lows)
+        remaining = extra
+        for i in order:
+            if remaining == 0:
+                break
+            take = min(remaining, highs[i] - lows[i])
+            wraps[i] += take
+            remaining -= take
+        if remaining != 0:
+            raise ValueError("剩余圈数超出各段余量之和（应先通过总量对账）")
+
+        allocations = []
+        total_num = 0
+        for i, (num_i, scale_i) in enumerate(prices):
+            usage = diffs[i] + wraps[i] * modulus
+            amount_num = num_i * usage
+            allocations.append(
+                ChargeSegmentAllocation(
+                    index=i,
+                    wraps=wraps[i],
+                    usage=usage,
+                    amount_numerator=amount_num,
+                    amount_scale=scale_i,
+                )
+            )
+            # 统一对齐到最大小数位后累加（整数运算，无浮点）
+            total_num += amount_num * 10 ** (total_scale - scale_i)
+        allocations.sort(key=lambda a: a.index)
+        return ChargeExtreme(
+            total_numerator=total_num,
+            total_scale=total_scale,
+            allocations=tuple(allocations),
+        )
+
+    return _solve(descending_price=False), _solve(descending_price=True)
 
 
 # ---------------------------------------------------------------------------

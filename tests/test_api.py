@@ -10,8 +10,10 @@ from fractions import Fraction
 from fastapi.testclient import TestClient
 
 from app.core import (
+    charge_amount_extremes,
     clip_merge_intervals,
     compare_dual_meter,
+    format_decimal_string,
     reconcile_meter_total,
     reconcile_total,
     solve_daily_segment,
@@ -2572,3 +2574,350 @@ def test_outage_reconcile_exact_by_brute_force():
                 assert (ns.min_wraps, ns.max_wraps) == (ks_i[0], ks_i[-1])
                 assert ns.unique == (ks_i[0] == ks_i[-1])
     assert checked > 300
+
+
+# ---------------------------------------------------------------------------
+# 分时单价账单金额区间 /v1/billing/charge-range
+# ---------------------------------------------------------------------------
+
+
+def _charge(payload):
+    return _post(payload, path="/v1/billing/charge-range")
+
+
+def _charge_payload(
+    total_usage=5000,
+    unit_prices=("2.50", "1.25"),
+    rate=10,
+    modulus=1000,
+    values=(100, 200, 100),
+    times=(
+        "2026-09-24T00:00:00Z",
+        "2026-09-24T00:16:40Z",
+        "2026-09-24T00:33:20Z",
+    ),
+):
+    return {
+        "modulus": modulus,
+        "max_rate_per_second": rate,
+        "total_usage": total_usage,
+        "unit_prices": list(unit_prices),
+        "readings": [
+            {"timestamp": t, "value": v} for t, v in zip(times, values)
+        ],
+    }
+
+
+def test_charge_range_extremes_two_segments():
+    """两段圈数 [0,4]/[1,5]、K=5（4 个剩余圈）：低价段全吃圈得最低，反之最高。"""
+    resp = _charge(_charge_payload())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["conflicts"] == []
+    assert body["total_wraps"] == 5
+    seg0, seg1 = body["segments"]
+    assert seg0["unit_price"] == "2.50" and seg1["unit_price"] == "1.25"
+    assert (seg0["min_wraps"], seg0["max_wraps"]) == (0, 4)
+    assert (seg1["min_wraps"], seg1["max_wraps"]) == (1, 5)
+    # 最低：剩余 4 圈全给低价段 1（1.25）：100*2.5 + 4900*1.25 = 6375
+    assert body["minimum"]["total_amount"] == "6375.00"
+    assert [(a["index"], a["wraps"], a["usage"], a["amount"])
+            for a in body["minimum"]["allocations"]] == [
+        (0, 0, 100, "250.00"),
+        (1, 5, 4900, "6125.00"),
+    ]
+    # 最高：4 圈全给高价段 0（2.5）：4100*2.5 + 900*1.25 = 11375
+    assert body["maximum"]["total_amount"] == "11375.00"
+    assert [(a["index"], a["wraps"], a["usage"], a["amount"])
+            for a in body["maximum"]["allocations"]] == [
+        (0, 4, 4100, "10250.00"),
+        (1, 1, 900, "1125.00"),
+    ]
+    # 两方案各段用量之和恒等于账单
+    for extreme in (body["minimum"], body["maximum"]):
+        assert sum(a["usage"] for a in extreme["allocations"]) == 5000
+        assert sum(a["wraps"] for a in extreme["allocations"]) == 5
+
+
+def test_charge_range_decimal_exact_no_floating_point():
+    """不同小数位单价：金额精确到分，不出现浮点尾数；总金额按最大小数位对齐。"""
+    resp = _charge(_charge_payload(unit_prices=("0.1", "0.01")))
+    body = resp.json()
+    assert body["status"] == "ok"
+    # 段 1 价 0.01 最低：100*0.1 + 4900*0.01 = 10 + 49 = 59.00
+    assert body["minimum"]["total_amount"] == "59.00"
+    assert [a["amount"] for a in body["minimum"]["allocations"]] == [
+        "10.0", "49.00"
+    ]
+    # 段 0 价 0.1 最高：4100*0.1 + 900*0.01 = 410 + 9 = 419.00
+    assert body["maximum"]["total_amount"] == "419.00"
+    assert [a["amount"] for a in body["maximum"]["allocations"]] == [
+        "410.0", "9.00"
+    ]
+    # 字符串中绝不出现浮点误差尾数
+    for extreme in (body["minimum"], body["maximum"]):
+        assert "e" not in extreme["total_amount"].lower()
+        for a in extreme["allocations"]:
+            assert "e" not in a["amount"].lower()
+
+
+def test_charge_range_greedy_partial_fill_and_tie_break():
+    """三段：低价段余量不足时继续填下一段；同价段按索引升序吃圈。"""
+    # 三段平读数 0->0->0->0 各 1000s，rate=5：各段 cap 5000 => k∈[0,5]
+    readings = [
+        {"timestamp": "2026-09-24T00:00:00Z", "value": 0},
+        {"timestamp": "2026-09-24T00:16:40Z", "value": 0},
+        {"timestamp": "2026-09-24T00:33:20Z", "value": 0},
+        {"timestamp": "2026-09-24T00:50:00Z", "value": 0},
+    ]
+    payload = {
+        "modulus": 1000,
+        "max_rate_per_second": 5,
+        "total_usage": 11000,  # K = 11
+        "unit_prices": ["2", "1", "1"],
+        "readings": readings,
+    }
+    body = _charge(payload).json()
+    assert body["status"] == "ok"
+    # 最低：段 1、2 同价 1 且低于段 0，各吃满 5 圈（共 10），余 1 圈给段 0
+    assert [(a["index"], a["wraps"], a["usage"])
+            for a in body["minimum"]["allocations"]] == [
+        (0, 1, 1000), (1, 5, 5000), (2, 5, 5000)
+    ]
+    assert body["minimum"]["total_amount"] == "12000"
+    # 最高：段 0 价 2 吃满 5 圈，余 6 圈在同价段 1、2 间按索引升序：段 1 满 5、段 2 得 1
+    assert [(a["index"], a["wraps"], a["usage"])
+            for a in body["maximum"]["allocations"]] == [
+        (0, 5, 5000), (1, 5, 5000), (2, 1, 1000)
+    ]
+    assert body["maximum"]["total_amount"] == "16000"
+
+
+def test_charge_range_equal_prices_extremes_coincide():
+    """各段单价相同：最低与最高金额相同（金额只取决于总量），方案均可行。"""
+    body = _charge(_charge_payload(unit_prices=("3", "3"))).json()
+    assert body["minimum"]["total_amount"] == body["maximum"]["total_amount"]
+    assert body["minimum"]["total_amount"] == "15000"  # 5000*3
+    for extreme in (body["minimum"], body["maximum"]):
+        assert sum(a["usage"] for a in extreme["allocations"]) == 5000
+
+
+def test_charge_range_zero_prices_and_unique_segments():
+    """单价为 0（合法非负）金额为 0；圈数全唯一时两方案一致并给出确定用量。"""
+    # 账单取 K=sum_low=1：两段圈数被唯一为 0、1，用量 100、900
+    body = _charge(
+        _charge_payload(total_usage=1000, unit_prices=("0", "0.5"))
+    ).json()
+    assert body["status"] == "ok"
+    for seg, wraps, usage in zip(body["segments"], (0, 1), (100, 900)):
+        assert (seg["wraps"], seg["usage"]) == (wraps, usage)
+        assert seg["min_usage"] is None and seg["max_usage"] is None
+    assert body["minimum"]["total_amount"] == "450.0"
+    assert body["maximum"]["total_amount"] == "450.0"
+    assert [a["amount"] for a in body["minimum"]["allocations"]] == [
+        "0", "450.0"
+    ]
+
+
+def test_charge_range_single_segment():
+    """单段：圈数被账单唯一确定，最低=最高且用量恰为账单。"""
+    body = _charge(
+        _charge_payload(
+            total_usage=3100,
+            unit_prices=("1.25",),
+            values=(100, 200),
+            times=("2026-09-24T00:00:00Z", "2026-09-24T00:16:40Z"),
+        )
+    ).json()
+    assert body["status"] == "ok"
+    (seg,) = body["segments"]
+    assert (seg["wraps"], seg["usage"]) == (3, 3100)
+    assert body["minimum"]["total_amount"] == "3875.00"
+    assert body["maximum"]["total_amount"] == "3875.00"
+    assert body["minimum"]["allocations"][0]["usage"] == 3100
+
+
+def test_charge_range_segment_no_solution_conflict():
+    """某段超过速率上限原本无解：分段冲突，不做总量/金额推断。"""
+    body = _charge(
+        _charge_payload(
+            total_usage=300,
+            rate=20,
+            values=(100, 300, 900),
+            times=(
+                "2026-09-24T00:00:00Z",
+                "2026-09-24T00:00:10Z",
+                "2026-09-24T00:00:11Z",
+            ),
+        )
+    ).json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    assert body["minimum"] is None and body["maximum"] is None
+    assert body["total_wraps"] is None
+    (conflict,) = body["conflicts"]
+    assert conflict["kind"] == "segment"
+    assert conflict["reason"] == "no_solution"
+    assert conflict["index"] == 1
+    assert conflict["max_wraps"] < conflict["min_wraps"]
+
+
+def test_charge_range_incompatible_modulus_conflict():
+    """账单与首尾读数差模 M 不同余：total_incompatible_modulus，与超界可区分。"""
+    body = _charge(_charge_payload(total_usage=5500)).json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    assert body["minimum"] is None and body["maximum"] is None
+    assert body["total_wraps"] is None
+    (conflict,) = body["conflicts"]
+    assert conflict["kind"] == "total"
+    assert conflict["reason"] == "total_incompatible_modulus"
+    assert conflict["expected_remainder"] == 0
+    assert (conflict["feasible_min_total"],
+            conflict["feasible_max_total"]) == (1000, 19000)
+
+
+def test_charge_range_out_of_range_conflict():
+    """账单同余但总圈数超出可行和：total_out_of_range，同余成立 K 已知。"""
+    body = _charge(_charge_payload(total_usage=0)).json()
+    assert body["status"] == "conflict"
+    (conflict,) = body["conflicts"]
+    assert conflict["reason"] == "total_out_of_range"
+    assert conflict["total_wraps"] == 0
+    assert conflict["expected_remainder"] is None
+    assert conflict["feasible_min_total"] == 1000
+
+
+def test_charge_range_price_count_must_equal_segments():
+    """单价数量不等于段数（读数数 − 1）：422。"""
+    payload = _charge_payload(unit_prices=("1", "2", "3"))  # 只有 2 段
+    assert _charge(payload).status_code == 422
+    payload = _charge_payload(unit_prices=("1",))  # 少于段数
+    assert _charge(payload).status_code == 422
+
+
+def test_charge_range_price_validation():
+    """单价为负、NaN、Infinity 均 422；数字形式与字符串形式均可精确解析。"""
+    for bad in (-1, "NaN", "Infinity", "-Infinity"):
+        payload = _charge_payload(unit_prices=(bad, "1"))
+        assert _charge(payload).status_code == 422, bad
+    # JSON 数字形式的十进制单价同样精确（服务端按 Decimal 解析）
+    payload = _charge_payload(unit_prices=(2.5, 1.25))
+    body = _charge(payload).json()
+    assert body["status"] == "ok"
+    assert body["minimum"]["total_amount"] == "6375.00"
+    assert body["maximum"]["total_amount"] == "11375.00"
+
+
+def test_charge_range_reuses_reading_validation():
+    """复用读数/模数/速率/账单校验：非法输入一律 422。"""
+    base = _charge_payload()
+    # 读数越界
+    bad = copy.deepcopy(base)
+    bad["readings"][1]["value"] = 1000
+    assert _charge(bad).status_code == 422
+    # 时间戳不递增
+    bad = copy.deepcopy(base)
+    bad["readings"][1]["timestamp"] = bad["readings"][0]["timestamp"]
+    assert _charge(bad).status_code == 422
+    # 缺时区
+    bad = copy.deepcopy(base)
+    bad["readings"][0]["timestamp"] = "2026-09-24T00:00:00"
+    assert _charge(bad).status_code == 422
+    # 亚秒
+    bad = copy.deepcopy(base)
+    bad["readings"][0]["timestamp"] = "2026-09-24T00:00:00.5Z"
+    assert _charge(bad).status_code == 422
+    # 负速率、负账单、模数 < 1
+    assert _charge({**base, "max_rate_per_second": -1}).status_code == 422
+    assert _charge({**base, "total_usage": -1}).status_code == 422
+    assert _charge({**base, "modulus": 0}).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# charge_amount_extremes 精确性：与全枚举（Fraction 计价）暴力结果比对
+# ---------------------------------------------------------------------------
+
+
+def test_charge_amount_extremes_exact_by_brute_force():
+    """随机小参数下，贪心极值与枚举全部圈数组合的最小/最大金额一致。"""
+    rng = random.Random(20260926)
+    checked = 0
+    for _ in range(3000):
+        n = rng.randint(1, 4)
+        modulus = rng.choice([2, 3, 5, 7, 10])
+        diffs = [rng.randrange(modulus) - rng.randrange(modulus) for _ in range(n)]
+        lows = [0 if d >= 0 else (-d + modulus - 1) // modulus for d in diffs]
+        highs = [lo + rng.randint(0, 4) for lo in lows]
+        # 单价随机取 1~3 位小数的非负整数分子
+        prices = [
+            (rng.randint(0, 20), rng.randint(0, 3)) for _ in range(n)
+        ]
+        total_scale = max(s for _, s in prices)
+
+        feasible_K = set()
+        for ks in itertools.product(
+            *[range(lo, hi + 1) for lo, hi in zip(lows, highs)]
+        ):
+            feasible_K.add(sum(ks))
+        K = rng.choice(sorted(feasible_K))
+        total_usage = sum(diffs) + K * modulus
+
+        minimum, maximum = charge_amount_extremes(
+            diffs, list(zip(lows, highs)), K, modulus, prices
+        )
+
+        combos = [
+            ks
+            for ks in itertools.product(
+                *[range(lo, hi + 1) for lo, hi in zip(lows, highs)]
+            )
+            if sum(ks) == K
+        ]
+        assert combos
+        amounts = []
+        for ks in combos:
+            num = sum(
+                num_i * (diffs[i] + ks[i] * modulus)
+                * 10 ** (total_scale - prices[i][1])
+                for i, (num_i, _s) in enumerate(prices)
+            )
+            amounts.append((num, ks))
+        amin = min(amounts, key=lambda x: (x[0], x[1]))[0]
+        # 最高金额在同价段间按索引升序吃圈 => 同值时圈数元组字典序最小
+        amax = min(
+            (pair for pair in amounts if pair[0] == max(a for a, _ in amounts)),
+            key=lambda x: x[1],
+        )[0]
+        kmin = max(
+            (ks for num, ks in amounts if num == amin), key=lambda ks: ks
+        )
+        kmax = max(
+            (ks for num, ks in amounts if num == amax), key=lambda ks: ks
+        )
+        assert minimum.total_numerator == amin
+        assert maximum.total_numerator == amax
+        assert minimum.total_scale == maximum.total_scale == total_scale
+        # 贪心方案本身是枚举组合之一，且段用量之和为账单
+        for extreme, ks_expect in ((minimum, kmin), (maximum, kmax)):
+            got_ks = tuple(a.wraps for a in extreme.allocations)
+            assert got_ks == ks_expect  # 同价时按索引升序的确定性平局
+            assert sum(a.usage for a in extreme.allocations) == total_usage
+            for i, al in enumerate(extreme.allocations):
+                assert al.usage == diffs[i] + got_ks[i] * modulus
+                assert al.amount_numerator == prices[i][0] * al.usage
+                assert al.amount_scale == prices[i][1]
+        checked += 1
+    assert checked > 1000
+
+
+def test_format_decimal_string():
+    """十进制字符串格式化：零、整数、定标小数与边界。"""
+    assert format_decimal_string(0, 0) == "0"
+    assert format_decimal_string(123, 0) == "123"
+    assert format_decimal_string(250, 2) == "2.50"
+    assert format_decimal_string(5, 2) == "0.05"
+    assert format_decimal_string(0, 2) == "0.00"
+    assert format_decimal_string(10250, 2) == "102.50"
+    assert format_decimal_string(1, 3) == "0.001"
