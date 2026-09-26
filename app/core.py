@@ -101,6 +101,22 @@
         k_max = floor((C - diff) / M)
     k_max < k_min 即单段无解。各段均可行后，账单总用量联立直接复用
     reconcile_total 的整数区间收紧（同余冲突 / 总量超界原因也一致）。
+
+分时单价账单金额区间（solve_charge_range）：
+    各段给定非负单价 p_i（精确分数，调用方由十进制字符串构造），金额
+    为 Σ p_i * u_i，其中 u_i = diff_i + k_i*M。冲突判定完全复用
+    reconcile_total：单段可行圈数区间 [lo_i, hi_i] 由读数/模数/速率
+    校验预先求出，账单总量先做模 M 同余（total_incompatible_modulus）
+    再做总圈数 K ∈ [Σlo_i, Σhi_i] 的超界判定（total_out_of_range）。
+    可行时 reconcile_total 已把各段圈数收紧为整数箱型区间
+    lo_i' <= k_i <= hi_i' 且 Σ k_i = K。记 k_i = lo_i' + t_i，则
+    0 <= t_i <= c_i（c_i = hi_i' - lo_i'）、Σ t_i = T = K - Σlo_i'。
+    金额 = 固定部分 Σ p_i*(diff_i + lo_i'*M) + M*Σ p_i*t_i，极值只
+    取决于后者：按单价从低到高依次把剩余圈数加满（同价按段索引升序）
+    即得最低金额方案，按单价从高到低加满即得最高金额方案（贪心：把一圈
+    从低价段换到高价段，金额方向单调；交换论证保证全局最优，无需枚举
+    圈数组合）。两方案各段用量之和恒等于账单总量。全程整数/Fraction
+    运算，不使用浮点数。
 """
 
 from __future__ import annotations
@@ -1238,4 +1254,153 @@ def compare_dual_meter(
         b_usage_max=b_usage_max,
         intersect_min=intersect_min,
         intersect_max=intersect_max,
+    )
+
+# ---------------------------------------------------------------------------
+# 分时单价账单金额区间（charge-range）：固定总圈数下贪心分配，不枚举组合
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChargeSegmentPlan:
+    """分时单价金额区间中，单段的收紧圈数范围与两个极值方案下的圈数/用量。"""
+
+    index: int
+    diff: int
+    # 账单总量收紧后仍可行的圈数区间 [min_wraps, max_wraps]
+    min_wraps: int
+    max_wraps: int
+    # 最低金额方案（剩余圈数优先给低价段）下该段的圈数与用量
+    min_amount_wraps: int
+    min_amount_usage: int
+    # 最高金额方案（剩余圈数优先给高价段）下该段的圈数与用量
+    max_amount_wraps: int
+    max_amount_usage: int
+
+
+@dataclass(frozen=True)
+class ChargeRangeResult:
+    """分时单价账单金额区间求解结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    conflicts: Tuple[str, ...]  # REASON_TOTAL_* 原因（单段无解由调用方先行拦截）
+    total_wraps: Optional[int]  # 账单总量隐含的总回绕次数 K（不相容时为 None）
+    feasible_min_total: int
+    feasible_max_total: int
+    segments: Tuple[ChargeSegmentPlan, ...]
+
+
+def _greedy_extra_wraps(
+    prices: Sequence[Fraction],
+    caps: Sequence[int],
+    extra: int,
+    descending: bool,
+) -> Tuple[int, ...]:
+    """把 ``extra`` 个剩余圈数按单价顺序贪心加满各段容量 ``caps``。
+
+    ``descending=False``：单价从低到高（同价按段索引升序），得到最低
+    金额分配；``descending=True``：单价从高到低（同价仍按段索引升序），
+    得到最高金额分配。容量均为整数且 ``Σ caps >= extra``（由
+    reconcile_total 的收紧区间保证），故一次性顺序填充即可分完，
+    不枚举任何圈数组合。
+    """
+    if descending:
+        order = sorted(range(len(prices)), key=lambda i: (-prices[i], i))
+    else:
+        order = sorted(range(len(prices)), key=lambda i: (prices[i], i))
+    allocated = [0] * len(prices)
+    remaining = extra
+    for i in order:
+        take = min(caps[i], remaining)
+        allocated[i] = take
+        remaining -= take
+        if remaining == 0:
+            break
+    return tuple(allocated)
+
+
+def solve_charge_range(
+    diffs: Sequence[int],
+    wrap_bounds: Sequence[Tuple[int, int]],
+    total_usage: int,
+    modulus: int,
+    prices: Sequence[Fraction],
+) -> ChargeRangeResult:
+    """分时单价下求账单应收金额的精确最小值/最大值及各自分段用量方案。
+
+    段 ``i`` 用量 ``u_i = diff_i + k_i*M``、单价 ``p_i >= 0``，金额
+    ``Σ p_i*u_i``。冲突判定完全复用 :func:`reconcile_total`：
+
+    1. 单段回绕可行整数区间 ``[lo_i, hi_i]`` 由调用方经读数/模数/速率
+       校验预先求出（单段无解由调用方先行拦截，不在本函数处理）；
+    2. 账单总量与首尾读数差模 M 不同余即
+       ``total_incompatible_modulus``；总圈数 K 不在
+       ``[Σlo_i, Σhi_i]`` 内即 ``total_out_of_range``。
+
+    可行时 ``reconcile_total`` 已把各段圈数收紧为整数箱型区间
+    ``lo_i' <= k_i <= hi_i'`` 且 ``Σ k_i = K``。写
+    ``k_i = lo_i' + t_i``，则 ``0 <= t_i <= c_i``（``c_i = hi_i' -
+    lo_i'``）、``Σ t_i = T = K - Σlo_i'``。金额
+
+        Σ p_i*(diff_i + lo_i'*M) + M*Σ p_i*t_i
+
+    的固定部分与 ``t_i`` 无关，故极值只需把 T 个剩余圈数按单价排序后
+    贪心分配：低价段优先加满使金额最低，高价段优先加满使金额最高
+    （交换论证：任一方案中若更高价段未加满而更低价段分到了圈，把一圈
+    移到低价/高价端即单调降低/升高金额，故贪心端点全局最优）。
+    两个方案的各段用量之和都严格等于 ``total_usage``。全程整数与
+    Fraction 运算，不使用浮点数，也不枚举圈数组合。
+
+    :param prices: 各段非负单价（精确分数，与段一一对应，数量须等于段数）
+    """
+    if not (len(diffs) == len(wrap_bounds) == len(prices)):
+        raise ValueError("diffs、wrap_bounds 与 prices 数量必须一致")
+    if any(p < 0 for p in prices):
+        raise ValueError("各段单价必须非负")
+
+    reconciled = reconcile_total(diffs, wrap_bounds, total_usage, modulus)
+    if reconciled.status == STATUS_CONFLICT:
+        return ChargeRangeResult(
+            status=STATUS_CONFLICT,
+            conflicts=reconciled.conflicts,
+            total_wraps=reconciled.total_wraps,
+            feasible_min_total=reconciled.feasible_min_total,
+            feasible_max_total=reconciled.feasible_max_total,
+            segments=(),
+        )
+
+    lows = [ns.min_wraps for ns in reconciled.narrowed]
+    highs = [ns.max_wraps for ns in reconciled.narrowed]
+    total_wraps = reconciled.total_wraps
+    assert total_wraps is not None
+    caps = [hi - lo for lo, hi in zip(lows, highs)]
+    extra = total_wraps - sum(lows)
+
+    min_extra = _greedy_extra_wraps(prices, caps, extra, descending=False)
+    max_extra = _greedy_extra_wraps(prices, caps, extra, descending=True)
+
+    segments = []
+    for i, ns in enumerate(reconciled.narrowed):
+        min_wraps_i = lows[i] + min_extra[i]
+        max_wraps_i = lows[i] + max_extra[i]
+        segments.append(
+            ChargeSegmentPlan(
+                index=ns.index,
+                diff=ns.diff,
+                min_wraps=ns.min_wraps,
+                max_wraps=ns.max_wraps,
+                min_amount_wraps=min_wraps_i,
+                min_amount_usage=ns.diff + min_wraps_i * modulus,
+                max_amount_wraps=max_wraps_i,
+                max_amount_usage=ns.diff + max_wraps_i * modulus,
+            )
+        )
+
+    return ChargeRangeResult(
+        status=STATUS_OK,
+        conflicts=(),
+        total_wraps=total_wraps,
+        feasible_min_total=reconciled.feasible_min_total,
+        feasible_max_total=reconciled.feasible_max_total,
+        segments=tuple(segments),
     )

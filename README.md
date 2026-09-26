@@ -16,6 +16,8 @@
 
 另提供**停水时段账单复核**接口：输入现有读数序列、模数、每秒速率上限、账单总用量及若干**左闭右开**的停水时段。停水时段先统一裁剪到读数账期，再合并重叠或相接（端点相同）的时段；每对相邻读数扣除停水后，把剩余的连续供水片段**分别**按 `floor(速率 × 秒数)` 取整并求和作为该段整数用量容量（**不能跨停水时段合并取整**），以此容量限制非负回绕圈数，再用账单总用量联立收紧各段可行圈数。返回各段供水秒数、供水片段明细、用量上下界与唯一性；**单段无解、账单同余冲突与总量超界**分别给出可区分的冲突原因。
 
+还提供**分时单价账单金额区间**接口 `POST /v1/billing/charge-range`：在账单总量对账的读数、模数、速率校验基础上，按每个相邻读数段给定**非负十进制单价**（数量必须等于段数）。先复用各段回绕可行整数区间与账单总量的同余/超界校验（**单段无解、总量同余不相容、总量超界**分别给出可区分原因）；可行时账单把固定总圈数约束在各段收紧后的整数区间内，将剩余圈数**按单价从低到高**与**从高到低**贪心分配（交换论证保证全局最优），精确返回**最低与最高应收金额（十进制字符串）及各自的分段用量方案**，两方案各段用量之和恒等于账单。全程整数 / `Fraction` / `Decimal` 精确运算，**不枚举圈数组合，也不使用浮点数**。
+
 ## 快速启动（Docker，一键）
 
 ```bash
@@ -33,6 +35,7 @@ docker compose up --build
 - 漏采读数推断：`POST http://localhost:8000/v1/usage/missing-reading`
 - 最小统一速率上限：`POST http://localhost:8000/v1/usage/minimum-rate`
 - 双表同段交叉核验：`POST http://localhost:8000/v1/usage/dual-meter/compare`
+- 分时单价账单金额区间：`POST http://localhost:8000/v1/billing/charge-range`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/health`
 
@@ -1074,6 +1077,102 @@ pytest
 
 请求校验错误（两表起止时刻不分别相同、段内时间不递增、缺时区、含亚秒、读数超出该表模数、负速率、模数 < 1 等）返回 `422`。
 
+### `POST /v1/billing/charge-range`
+
+分时单价账单金额区间。请求体在账单对账接口字段基础上增加 `segment_prices`（按相邻读数段顺序给出的**非负十进制单价**）；读数、模数、速率、`total_usage` 的校验与 `/v1/usage/reconcile` 完全一致。单价数量必须**恰好等于段数**（`readings` 条数 − 1），第 `i` 项对应第 `i` 个相邻读数段。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "max_rate_per_second": 10,
+  "total_usage": 5000,
+  "segment_prices": ["1.25", "2.50"],
+  "readings": [
+    { "timestamp": "2026-09-24T00:00:00Z", "value": 100 },
+    { "timestamp": "2026-09-24T00:16:40Z", "value": 200 },
+    { "timestamp": "2026-09-24T00:33:20Z", "value": 100 }
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `total_usage` | 整数 | `>= 0`，账单总用量（非负整数） |
+| `segment_prices` | 十进制数数组 | 每项为**有限、非负**十进制数（支持小数，按精确分数 / `Decimal` 计算）；数量必须等于相邻读数段数，否则 `422` |
+| 其余字段 | — | 与 `/v1/usage/verify` 相同 |
+
+**响应（可行，`200`，`status = "ok"`）**
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_usage": 5000,
+  "total_wraps": 5,
+  "min_amount": "7375",
+  "max_amount": "12375",
+  "segments": [
+    {
+      "index": 0,
+      "start_timestamp": "2026-09-24T00:00:00Z",
+      "end_timestamp": "2026-09-24T00:16:40Z",
+      "start_reading": 100,
+      "end_reading": 200,
+      "elapsed_seconds": 1000,
+      "unit_price": "1.25",
+      "min_wraps": 0,
+      "max_wraps": 4,
+      "min_amount_wraps": 4,
+      "min_amount_usage": 4100,
+      "min_amount": "5125",
+      "max_amount_wraps": 0,
+      "max_amount_usage": 100,
+      "max_amount": "125"
+    },
+    {
+      "index": 1,
+      "start_timestamp": "2026-09-24T00:16:40Z",
+      "end_timestamp": "2026-09-24T00:33:20Z",
+      "start_reading": 200,
+      "end_reading": 100,
+      "elapsed_seconds": 1000,
+      "unit_price": "2.5",
+      "min_wraps": 1,
+      "max_wraps": 5,
+      "min_amount_wraps": 1,
+      "min_amount_usage": 900,
+      "min_amount": "2250",
+      "max_amount_wraps": 5,
+      "max_amount_usage": 4900,
+      "max_amount": "12250"
+    }
+  ],
+  "conflicts": []
+}
+```
+
+上例中账单 5000 隐含总圈数 `K = 5`，两段收紧后的圈数区间为 `[0,4]` 与 `[1,5]`。两段用量之和恒为 5000：
+
+- **最低金额**：4 个剩余圈数全部给单价更低的段 0，分段用量 `(4100, 900)`，金额 `4100×1.25 + 900×2.5 = 5125 + 2250 = "7375"`；
+- **最高金额**：4 个剩余圈数全部给单价更高的段 1，分段用量 `(100, 4900)`，金额 `100×1.25 + 4900×2.5 = 125 + 12250 = "12375"`。
+
+- `min_amount` / `max_amount`：最低 / 最高应收金额，均为**十进制字符串**（由十进制单价与整数用量做 `Decimal` 精确乘加得到，去除尾随零、无指数，**不存在二进制浮点尾数**）；`segments[*].min_amount` / `max_amount` 为对应方案的分段金额，分别求和即总金额。
+- `min_wraps` / `max_wraps`：账单总量约束后该段仍可行的圈数范围（与 `/v1/usage/reconcile` 的收紧结果一致）。
+- `min_amount_wraps` / `min_amount_usage`（`max_*` 同理）：最低（最高）金额方案下该段的圈数与用量；方案可行（圈数落在收紧区间内），且各段 `min_amount_usage` 之和、`max_amount_usage` 之和都**严格等于 `total_usage`**。
+- 单价相等的段不影响金额：贪心在同价段间按段索引升序填充，结果确定；各段全部同价时 `min_amount == max_amount`（总额固定，金额与圈数分配无关）。
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+冲突原因与 `/v1/usage/reconcile` 完全一致，可区分三类：
+
+- `kind = "segment"`，`reason = "no_solution"`：某段在非负增量 / 速率上限下原本无解（复用逐段判定）；存在分段冲突时不再进行总量推断，`segments` 为空。
+- `kind = "total"`，`reason = "total_incompatible_modulus"`：账单总量与首尾读数差模 `modulus` 不同余，总回绕次数不是整数；`expected_remainder` 给出应有的余数，`total_wraps` 为 `null`。
+- `kind = "total"`，`reason = "total_out_of_range"`：账单同余但总圈数 `K` 超出 `[Σk_min, Σk_max]`，即可行账单总量不在 `[feasible_min_total, feasible_max_total]` 内；`total_wraps` 给出账单隐含的 `K`。
+
+冲突时 `min_amount` / `max_amount` 为 `null`、`segments` 为空。请求校验错误（单价数量与段数不符、单价为负或 `NaN` / `Infinity`、读数越界、时间不递增、缺时区、含亚秒、负速率、账单为负或非整数等）返回 `422`。
+
 ## 判定规则
 
 对每段相邻读数 `(r1, t1) -> (r2, t2)`，真实增量为 `delta = (r2 - r1) + k * modulus`，其中 `k >= 0` 为整圈回绕次数。约束：
@@ -1273,12 +1372,38 @@ u = d1 + k1·M1 = d2 + k2·M2 （k1, k2 为非负整数圈数）
 
 全程仅用整除、`ceil/floor` 与一次扩展欧几里得，无浮点（速率上限仍由 `Fraction` 精确计算），候选数再大也与枚举量无关。`M1 == M2` 时 `L = M`，自然退化为统一模数的同余联立。
 
+### 分时单价账单金额区间
+
+各段先由非负增量与速率上限求出可行回绕圈数区间 `[lo_i, hi_i]`（单段 `hi_i < lo_i` 即**单段无解**）。全部段可行后，账单总量校验与「账单总量对账」完全相同：账单 `B` 与首尾读数差模 `M` 不同余即**总量同余不相容**（`total_incompatible_modulus`）；总圈数 `K = (B − Σdiff)/M` 不在 `[Σlo_i, Σhi_i]` 内即**总量超界**（`total_out_of_range`）。
+
+可行时各段圈数已被收紧为整数箱型区间 `lo_i' <= k_i <= hi_i'` 且 `Σ k_i = K`。写 `k_i = lo_i' + t_i`，记 `c_i = hi_i' − lo_i'`、`T = K − Σlo_i'`，则
+
+```
+0 <= t_i <= c_i，Σ t_i = T
+```
+
+段 `i` 用量 `u_i = diff_i + k_i·M`、单价 `p_i >= 0`，应收金额为
+
+```
+Σ p_i·u_i = Σ p_i·(diff_i + lo_i'·M) + M·Σ p_i·t_i
+            └──────── 固定部分，与 t_i 无关 ────┘   └ 只取决于剩余圈数分配 ┘
+```
+
+固定部分不影响极值，故：
+
+- **最低金额**：把 `T` 个剩余圈数按单价**从低到高**依次加满各段容量 `c_i`（同价按段索引升序）；
+- **最高金额**：按单价**从高到低**依次加满（同价仍按段索引升序）。
+
+贪心全局最优由交换论证直接得到：若某方案中更高价（更低价）段尚未加满而更低价（更高价）段分到了圈，把一圈移到高（低）价端会严格单调升高（降低）金额；不断交换即收敛到上述贪心端点。该算法只需一次排序与一次顺序填充，**不枚举任何圈数组合**，与圈数区间大小无关。两个方案的各段用量之和都恒等于账单 `B`。
+
+金额由十进制单价（`Decimal`）与整数用量精确乘加，结果以**十进制字符串**返回（无指数、去尾随零）；冲突判定与收紧区间全程用整数 / `Fraction`，**不使用浮点数**。`T = 0`（账单取可行下界）时无剩余圈数可分，两个方案相同。
+
 ## 项目结构
 
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账、停水裁剪合并与供水片段容量、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛与双表同余联立（Fraction 精确计算）
+  core.py   # 回绕次数判定、总量对账、停水裁剪合并与供水片段容量、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛、双表同余联立与分时单价金额区间贪心（Fraction/Decimal 精确计算）
 tests/
   test_api.py
 Dockerfile

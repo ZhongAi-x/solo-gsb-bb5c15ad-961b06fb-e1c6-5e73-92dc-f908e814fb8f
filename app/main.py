@@ -26,6 +26,7 @@ from app.core import (
     compare_dual_meter,
     reconcile_meter_total,
     reconcile_total,
+    solve_charge_range,
     solve_daily_segment,
     solve_minimum_rate,
     solve_missing_reading,
@@ -35,7 +36,7 @@ from app.core import (
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
@@ -56,7 +57,12 @@ app = FastAPI(
         "合并重叠或相接时段，各相邻读数段扣除停水后把剩余连续供水片段"
         "分别 floor(速率×秒数) 取整求和作为段容量（不跨停水合并取整），"
         "再以账单总用量联立收紧各段可行圈数，区分单段无解、账单同余"
-        "冲突与总量超界。"
+        "冲突与总量超界；"
+        "另支持分时单价账单金额区间：按相邻读数段给定非负十进制单价，"
+        "复用读数、模数、速率与账单总用量校验，可行时把固定总圈数在各段"
+        "收紧区间内按单价从低到高 / 从高到低贪心分配剩余圈数，精确给出"
+        "最低与最高应收金额及各自分段用量方案，金额以十进制字符串返回，"
+        "不枚举圈数组合、不使用浮点数。"
     ),
 )
 
@@ -145,6 +151,42 @@ class MinimumRateRequest(_BaseReadingsRequest):
     total_usage: int = Field(
         ge=0, description="账单总用量（非负整数）"
     )
+
+
+class ChargeRangeRequest(_BaseUsageRequest):
+    """分时单价账单金额区间请求：读数、模数、速率、账单总量与各段单价。
+
+    读数、时间戳、模数与速率校验与 `/v1/usage/reconcile` 完全一致（复用
+    同一校验）。``segment_prices`` 按相邻读数段顺序给出非负十进制单价，
+    数量必须恰好等于段数（读数条数 − 1）。
+    """
+
+    total_usage: int = Field(ge=0, description="账单总用量（非负整数）")
+    segment_prices: List[Decimal] = Field(
+        min_length=1,
+        description="各相邻读数段的非负单价（十进制，支持小数，按精确分数计算）；"
+        "数量必须等于段数（readings 条数 − 1），第 i 项对应第 i 个相邻读数段",
+    )
+
+    @field_validator("segment_prices")
+    @classmethod
+    def _check_prices_finite(cls, v: List[Decimal]) -> List[Decimal]:
+        for p in v:
+            if not p.is_finite():
+                raise ValueError("单价必须为有限十进制数（不允许 NaN / Infinity）")
+            if p < 0:
+                raise ValueError(f"单价必须非负，收到 {p}")
+        return v
+
+    @model_validator(mode="after")
+    def _check_price_count(self) -> "ChargeRangeRequest":
+        expected = len(self.readings) - 1
+        if len(self.segment_prices) != expected:
+            raise ValueError(
+                f"单价数量必须等于相邻读数段数：{len(self.readings)} 条读数对应 "
+                f"{expected} 段，收到 {len(self.segment_prices)} 个单价"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +827,96 @@ class MinimumRateResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 分时单价账单金额区间接口响应模型
+# ---------------------------------------------------------------------------
+
+
+class ChargeSegmentOut(BaseModel):
+    """一个相邻读数段的收紧圈数范围与最低/最高金额方案下的用量。"""
+
+    index: int
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    unit_price: str = Field(
+        description="该段单价（回显请求的十进制字符串，规范化显示）"
+    )
+    min_wraps: int = Field(description="账单总量约束后仍可行的最小回绕次数")
+    max_wraps: int = Field(description="账单总量约束后仍可行的最大回绕次数")
+    min_amount_wraps: int = Field(
+        description="最低金额方案（剩余圈数优先给低价段）下该段的回绕次数"
+    )
+    min_amount_usage: int = Field(description="最低金额方案下该段用量（计数增量）")
+    min_amount: str = Field(
+        description="最低金额方案下该段金额 unit_price × min_amount_usage（十进制字符串）"
+    )
+    max_amount_wraps: int = Field(
+        description="最高金额方案（剩余圈数优先给高价段）下该段的回绕次数"
+    )
+    max_amount_usage: int = Field(description="最高金额方案下该段用量（计数增量）")
+    max_amount: str = Field(
+        description="最高金额方案下该段金额 unit_price × max_amount_usage（十进制字符串）"
+    )
+
+
+class ChargeSegmentErrorOut(BaseModel):
+    kind: Literal["segment"] = Field(description="冲突层级：分段")
+    index: int
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    reason: Literal["no_solution"]
+    detail: str
+    min_wraps: int
+    max_wraps: int
+
+
+class ChargeTotalErrorOut(BaseModel):
+    kind: Literal["total"] = Field(description="冲突层级：账单总量")
+    reason: Literal[
+        "total_incompatible_modulus", "total_out_of_range"
+    ]
+    detail: str
+    feasible_min_total: int = Field(description="可行账单总量的下界（含）")
+    feasible_max_total: int = Field(description="可行账单总量的上界（含）")
+    expected_remainder: Optional[int] = Field(
+        default=None, description="与模数相容时账单总量应有的模 M 余数"
+    )
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="账单总量隐含的总回绕次数 K；与模数不相容时为 null",
+    )
+
+
+class ChargeRangeResponse(BaseModel):
+    status: Literal["ok", "conflict"]
+    modulus: int
+    total_usage: int = Field(description="请求给出的账单总用量")
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="账单总量隐含的总回绕次数 K；冲突时可能为 null",
+    )
+    min_amount: Optional[str] = Field(
+        default=None,
+        description="最低应收金额（十进制字符串，精确值）；冲突时为 null",
+    )
+    max_amount: Optional[str] = Field(
+        default=None,
+        description="最高应收金额（十进制字符串，精确值）；冲突时为 null",
+    )
+    segments: List[ChargeSegmentOut] = Field(
+        description="各段收紧圈数范围及最低/最高金额方案下的圈数、用量与分段金额；冲突时为空"
+    )
+    conflicts: List[
+        Union[ChargeSegmentErrorOut, ChargeTotalErrorOut]
+    ] = Field(description="冲突明细：某段原本无解，或账单总量与模数不相容/超界")
+
+
+# ---------------------------------------------------------------------------
 # 公共逻辑
 # ---------------------------------------------------------------------------
 
@@ -795,6 +927,20 @@ def _no_solution_detail(diff: int, modulus: int, sol, elapsed: int) -> str:
         f"{elapsed}s 内允许的最大增量 {sol.max_allowed}"
         f"（k 需同时满足 k>={sol.min_wraps} 与 k<={sol.max_wraps}，区间为空）"
     )
+
+
+def _decimal_str(value: Decimal) -> str:
+    """把非负有限 Decimal 格式化为无指数、去除多余尾随零的十进制字符串。
+
+    金额由十进制单价与整数用量做 Decimal 精确乘加得到（无浮点），此函数
+    仅负责规范化展示（``1.20`` -> ``"1.2"``、``0.00`` -> ``"0"``）。
+    """
+    if not value.is_finite():
+        raise ValueError("金额必须为有限十进制数")
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text if text else "0"
 
 
 def _solve_all(req: _BaseUsageRequest):
@@ -984,6 +1130,159 @@ def reconcile_usage(req: ReconcileRequest) -> ReconcileResponse:
         modulus=req.modulus,
         total_usage=req.total_usage,
         total_wraps=result.total_wraps,
+        segments=segments,
+        conflicts=[],
+    )
+
+
+@app.post("/v1/billing/charge-range", response_model=ChargeRangeResponse)
+def billing_charge_range(req: ChargeRangeRequest) -> ChargeRangeResponse:
+    """分时单价账单金额区间：精确给出最低/最高应收金额及各自分段用量方案。
+
+    复用现有逐段读数、模数、速率上限与账单总用量校验。每段先求满足非负
+    增量与速率上限的可行回绕整数区间；任一区间无解即以分段冲突返回，
+    不进行总量推断。各段均可行后做与 ``/v1/usage/reconcile`` 相同的
+    账单总量校验：总量与首尾读数差模 M 不同余即
+    ``total_incompatible_modulus``，总圈数 K 超出
+    ``[Σk_min, Σk_max]`` 即 ``total_out_of_range``。
+
+    可行时总量约束把各段圈数收紧为整数箱型区间 ``[lo_i', hi_i']`` 且
+    ``Σ k_i = K``。写 ``k_i = lo_i' + t_i``，金额的固定部分
+    ``Σ p_i·(diff_i + lo_i'·M)`` 与 ``t_i`` 无关，故把 T 个剩余圈数
+    按单价从低到高依次加满各段剩余容量即得最低金额方案，按单价从高到低
+    加满即得最高金额方案（交换论证保证全局最优）；同价段按段索引升序，
+    结果唯一确定。两个方案的各段用量之和都严格等于 ``total_usage``。
+    金额由十进制单价与整数用量做 Decimal 精确乘加，以十进制字符串返回，
+    不使用浮点数，也不枚举圈数组合。
+    """
+    solved = _solve_all(req)
+
+    # 1) 某段原本无解：直接构成冲突，不进行总量推断
+    segment_conflicts: List[ChargeSegmentErrorOut] = []
+    feasible = []
+    for a, b, elapsed, sol in solved:
+        if sol.status == STATUS_NO_SOLUTION:
+            segment_conflicts.append(
+                ChargeSegmentErrorOut(
+                    kind="segment",
+                    index=sol.index,
+                    start_timestamp=a.timestamp,
+                    end_timestamp=b.timestamp,
+                    start_reading=a.value,
+                    end_reading=b.value,
+                    elapsed_seconds=elapsed,
+                    reason=STATUS_NO_SOLUTION,
+                    detail=_no_solution_detail(b.value - a.value, req.modulus, sol, elapsed),
+                    min_wraps=sol.min_wraps,
+                    max_wraps=sol.max_wraps,
+                )
+            )
+        else:
+            feasible.append((a, b, elapsed, sol))
+
+    if segment_conflicts:
+        return ChargeRangeResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            total_usage=req.total_usage,
+            total_wraps=None,
+            min_amount=None,
+            max_amount=None,
+            segments=[],
+            conflicts=segment_conflicts,
+        )
+
+    # 2) 各段本身可行：复用账单总量同余/超界判定，再贪心分配剩余圈数
+    diffs = [b.value - a.value for a, b, _, _ in feasible]
+    bounds = [(sol.min_wraps, sol.max_wraps) for *_, sol in feasible]
+    price_fractions = [Fraction(p) for p in req.segment_prices]
+    result = solve_charge_range(
+        diffs, bounds, req.total_usage, req.modulus, price_fractions
+    )
+
+    if result.status == STATUS_CONFLICT:
+        end_minus_start = sum(diffs)
+        expected_remainder = end_minus_start % req.modulus
+        total_conflicts = []
+        for reason in result.conflicts:
+            if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS:
+                detail = (
+                    f"账单总量与模数不相容：总量 B 必须满足 "
+                    f"B ≡ {expected_remainder} (mod {req.modulus})"
+                    f"（首尾读数差为 {end_minus_start}），收到 "
+                    f"{req.total_usage}（余数 {req.total_usage % req.modulus}），"
+                    f"总回绕次数不是整数"
+                )
+            else:  # REASON_TOTAL_OUT_OF_RANGE
+                detail = (
+                    f"账单总量超出可行范围：各段回绕次数均为非负整数且满足"
+                    f"速率上限时，总用量只能在 [{result.feasible_min_total}, "
+                    f"{result.feasible_max_total}]（模数 {req.modulus}）之内，"
+                    f"收到 {req.total_usage}"
+                )
+            total_conflicts.append(
+                ChargeTotalErrorOut(
+                    kind="total",
+                    reason=reason,  # type: ignore[arg-type]
+                    detail=detail,
+                    feasible_min_total=result.feasible_min_total,
+                    feasible_max_total=result.feasible_max_total,
+                    expected_remainder=(
+                        expected_remainder
+                        if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS
+                        else None
+                    ),
+                    total_wraps=result.total_wraps,
+                )
+            )
+        return ChargeRangeResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            total_usage=req.total_usage,
+            total_wraps=result.total_wraps,
+            min_amount=None,
+            max_amount=None,
+            segments=[],
+            conflicts=total_conflicts,
+        )
+
+    # 3) 可行：组装最低/最高金额方案；Decimal 精确乘加，不使用浮点数
+    segments: List[ChargeSegmentOut] = []
+    min_total_amount = Decimal(0)
+    max_total_amount = Decimal(0)
+    for (a, b, elapsed, _), plan in zip(feasible, result.segments):
+        price = req.segment_prices[plan.index]
+        min_part_amount = price * plan.min_amount_usage
+        max_part_amount = price * plan.max_amount_usage
+        min_total_amount += min_part_amount
+        max_total_amount += max_part_amount
+        segments.append(
+            ChargeSegmentOut(
+                index=plan.index,
+                start_timestamp=a.timestamp,
+                end_timestamp=b.timestamp,
+                start_reading=a.value,
+                end_reading=b.value,
+                elapsed_seconds=elapsed,
+                unit_price=_decimal_str(price),
+                min_wraps=plan.min_wraps,
+                max_wraps=plan.max_wraps,
+                min_amount_wraps=plan.min_amount_wraps,
+                min_amount_usage=plan.min_amount_usage,
+                min_amount=_decimal_str(min_part_amount),
+                max_amount_wraps=plan.max_amount_wraps,
+                max_amount_usage=plan.max_amount_usage,
+                max_amount=_decimal_str(max_part_amount),
+            )
+        )
+
+    return ChargeRangeResponse(
+        status=STATUS_OK,
+        modulus=req.modulus,
+        total_usage=req.total_usage,
+        total_wraps=result.total_wraps,
+        min_amount=_decimal_str(min_total_amount),
+        max_amount=_decimal_str(max_total_amount),
         segments=segments,
         conflicts=[],
     )
